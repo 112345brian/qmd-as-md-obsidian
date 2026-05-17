@@ -92,6 +92,11 @@ export class QmdOutlineView extends ItemView {
   }
 
   async onOpen(): Promise<void> {
+    // Enforce singleton: detach any other outline leaves so only this one
+    // remains. Covers manual splits, popouts, or duplicate spawns.
+    for (const leaf of this.app.workspace.getLeavesOfType(QMD_OUTLINE_VIEW)) {
+      if (leaf !== this.leaf) leaf.detach();
+    }
     // The outline may already be the active leaf at this point (opened via
     // command/setting), so capture the underlying .qmd before rendering.
     this.plugin.trackActiveQuartoFile();
