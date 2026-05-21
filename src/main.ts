@@ -91,6 +91,7 @@ interface QmdPluginSettings {
   openPdfInObsidian: boolean;
   previewInObsidian: boolean;
   previewMarkdownFiles: boolean;
+  outlineMarkdownFiles: boolean;
   showYamlFiles: boolean;
   showLuaFiles: boolean;
   showOutline: boolean;
@@ -111,6 +112,7 @@ const DEFAULT_SETTINGS: QmdPluginSettings = {
   openPdfInObsidian: false,
   previewInObsidian: true,
   previewMarkdownFiles: false,
+  outlineMarkdownFiles: false,
   showYamlFiles: false,
   showLuaFiles: false,
   showOutline: false,
@@ -462,12 +464,18 @@ export default class QmdAsMdPlugin extends Plugin {
     this.refreshOutlineViews();
   }
 
-  // Remember the active .qmd file. Called whenever the active leaf changes;
-  // a non-.qmd active leaf (including the outline sidebar itself) leaves the
-  // last value untouched so the outline keeps describing that file.
+  // Remember the active file the outline should describe. Called whenever the
+  // active leaf changes; an active leaf the outline cannot describe (a non-.qmd
+  // file, or a .md file when outlineMarkdownFiles is off, including the outline
+  // sidebar itself) leaves the last value untouched so the outline keeps
+  // describing that file.
   trackActiveQuartoFile(): void {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (view?.file && this.isQuartoFile(view.file)) {
+    if (!view?.file) return;
+    if (
+      this.isQuartoFile(view.file) ||
+      (this.settings.outlineMarkdownFiles && this.isMarkdownFile(view.file))
+    ) {
       this.lastActiveQuartoFile = view.file;
     }
   }
@@ -1100,6 +1108,32 @@ class QmdSettingTab extends PluginSettingTab {
             } else {
               this.plugin.detachOutlineViews();
             }
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Outline Markdown files')
+      .setDesc(
+        'When on, the Quarto outline also lists headings of the active .md file, not just .qmd files. ' +
+          "Obsidian's core Outline panel already covers .md files — enable this only if you prefer the Quarto outline for both."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.outlineMarkdownFiles)
+          .onChange(async (value) => {
+            this.plugin.settings.outlineMarkdownFiles = value;
+            await this.plugin.saveSettings();
+            // Drop a now-ineligible .md target so the outline does not keep
+            // describing a file it is no longer allowed to.
+            if (
+              !value &&
+              this.plugin.lastActiveQuartoFile &&
+              this.plugin.isMarkdownFile(this.plugin.lastActiveQuartoFile)
+            ) {
+              this.plugin.lastActiveQuartoFile = null;
+            }
+            this.plugin.trackActiveQuartoFile();
+            this.plugin.refreshOutlineViews();
           })
       );
   }

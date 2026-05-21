@@ -1,4 +1,4 @@
-import { ItemView, MarkdownView, TFile, WorkspaceLeaf } from 'obsidian';
+import { ItemView, MarkdownView, TFile, WorkspaceLeaf, setIcon } from 'obsidian';
 import type QmdAsMdPlugin from './main';
 
 // --- Quarto outline -------------------------------------------------------
@@ -19,6 +19,26 @@ interface QmdHeading {
   level: number;
   text: string;
   line: number; // 0-based line index in the source
+}
+
+interface QmdHeadingNode extends QmdHeading {
+  children: QmdHeadingNode[];
+}
+
+// Nest a flat heading list into a tree so the outline can fold sub-trees,
+// matching Obsidian's core Outline panel. A heading owns every later heading
+// of a deeper level until one at its own level or shallower appears. Levels
+// may skip (h1 -> h3); the level-stack handles that without synthetic nodes.
+function buildHeadingTree(headings: QmdHeading[]): QmdHeadingNode[] {
+  const roots: QmdHeadingNode[] = [];
+  const stack: QmdHeadingNode[] = [];
+  for (const h of headings) {
+    const node: QmdHeadingNode = { ...h, children: [] };
+    while (stack.length && stack[stack.length - 1].level >= h.level) stack.pop();
+    (stack.length ? stack[stack.length - 1].children : roots).push(node);
+    stack.push(node);
+  }
+  return roots;
 }
 
 function parseQmdHeadings(content: string): QmdHeading[] {
@@ -73,6 +93,11 @@ function parseQmdHeadings(content: string): QmdHeading[] {
 
 export class QmdOutlineView extends ItemView {
   plugin: QmdAsMdPlugin;
+  // Headings whose children are folded away. Keyed by a text-path (the chain
+  // of ancestor heading texts) so a fold survives the re-render that an edit
+  // elsewhere in the file triggers — a line-based key would drift. Lives for
+  // the view's lifetime; cleared only when the view is closed.
+  private collapsed = new Set<string>();
 
   constructor(leaf: WorkspaceLeaf, plugin: QmdAsMdPlugin) {
     super(leaf);
@@ -123,7 +148,9 @@ export class QmdOutlineView extends ItemView {
     if (!file) {
       container.createDiv({
         cls: 'qmd-outline-empty',
-        text: 'No Quarto (.qmd) file is active.',
+        text: this.plugin.settings.outlineMarkdownFiles
+          ? 'No Quarto (.qmd) or Markdown (.md) file is active.'
+          : 'No Quarto (.qmd) file is active.',
       });
       return;
     }
@@ -149,35 +176,94 @@ export class QmdOutlineView extends ItemView {
     }
 
     const list = container.createDiv({ cls: 'qmd-outline-list' });
-    for (const heading of headings) {
-      const item = list.createDiv({
-        cls: 'qmd-outline-item',
-        text: heading.text,
-        // Keyboard-accessible: focusable, announced as a link, and the
-        // keydown handler below makes Enter/Space activate it.
-        attr: { tabindex: '0', role: 'link' },
-      });
-      // Indentation is driven by CSS off this attribute — no inline styles.
-      item.dataset.level = String(heading.level);
+    for (const node of buildHeadingTree(headings)) {
+      this.renderNode(list, node, file, '');
+    }
+  }
 
-      const jumpTo = () => {
-        // Resolve the editor by file, not by "active leaf" — the click
-        // itself just moved focus to this sidebar.
-        const view = this.markdownViewFor(file);
-        if (!view) return;
-        const pos = { line: heading.line, ch: 0 };
-        this.app.workspace.setActiveLeaf(view.leaf, { focus: true });
-        view.editor.setCursor(pos);
-        view.editor.scrollIntoView({ from: pos, to: pos }, true);
-        view.editor.focus();
-      };
+  // Render one heading row plus, recursively, its sub-tree. A heading with
+  // children gets a chevron that folds them away; the fold state is kept in
+  // this.collapsed so it persists across re-renders.
+  private renderNode(
+    parentEl: HTMLElement,
+    node: QmdHeadingNode,
+    file: TFile,
+    parentPath: string
+  ): void {
+    // Path = ancestor heading texts chained. A newline cannot occur in a
+    // heading's text, so it is a collision-free separator between levels.
+    const path = `${parentPath}\n${node.level}:${node.text}`;
+    const hasChildren = node.children.length > 0;
+    let isCollapsed = hasChildren && this.collapsed.has(path);
 
-      item.addEventListener('click', jumpTo);
-      item.addEventListener('keydown', (evt) => {
-        if (evt.key === 'Enter' || evt.key === ' ') {
-          evt.preventDefault();
-          jumpTo();
-        }
+    const item = parentEl.createDiv({
+      cls: 'qmd-outline-item',
+      // Keyboard-accessible: focusable, announced as a link, and the keydown
+      // handler below makes Enter/Space jump and Left/Right fold.
+      attr: { tabindex: '0', role: 'link' },
+    });
+    // Indentation is driven by CSS off this attribute — no inline styles.
+    item.dataset.level = String(node.level);
+
+    // Toggle slot is always present (even leaf headings) so heading text
+    // lines up regardless of whether a chevron is shown.
+    const toggle = item.createSpan({ cls: 'qmd-outline-toggle' });
+    item.createSpan({ cls: 'qmd-outline-item-text', text: node.text });
+
+    let childrenEl: HTMLElement | null = null;
+    if (hasChildren) {
+      setIcon(toggle, 'chevron-down');
+      toggle.addClass('is-clickable');
+      childrenEl = parentEl.createDiv({ cls: 'qmd-outline-children' });
+      for (const child of node.children) {
+        this.renderNode(childrenEl, child, file, path);
+      }
+    }
+
+    const applyFold = () => {
+      item.toggleClass('is-collapsed', isCollapsed);
+      childrenEl?.toggleClass('is-collapsed', isCollapsed);
+    };
+    const setFold = (collapse: boolean) => {
+      isCollapsed = collapse;
+      if (collapse) this.collapsed.add(path);
+      else this.collapsed.delete(path);
+      applyFold();
+    };
+    applyFold(); // reflect any persisted fold state on first paint
+
+    const jumpTo = () => {
+      // Resolve the editor by file, not by "active leaf" — the click itself
+      // just moved focus to this sidebar.
+      const view = this.markdownViewFor(file);
+      if (!view) return;
+      const pos = { line: node.line, ch: 0 };
+      this.app.workspace.setActiveLeaf(view.leaf, { focus: true });
+      view.editor.setCursor(pos);
+      view.editor.scrollIntoView({ from: pos, to: pos }, true);
+      view.editor.focus();
+    };
+
+    item.addEventListener('click', jumpTo);
+    item.addEventListener('keydown', (evt) => {
+      if (evt.key === 'Enter' || evt.key === ' ') {
+        evt.preventDefault();
+        jumpTo();
+      } else if (hasChildren && evt.key === 'ArrowRight' && isCollapsed) {
+        evt.preventDefault();
+        setFold(false);
+      } else if (hasChildren && evt.key === 'ArrowLeft' && !isCollapsed) {
+        evt.preventDefault();
+        setFold(true);
+      }
+    });
+
+    if (hasChildren) {
+      toggle.addEventListener('click', (evt) => {
+        // Fold instead of jumping; the click would otherwise bubble to the
+        // row's jump handler.
+        evt.stopPropagation();
+        setFold(!isCollapsed);
       });
     }
   }
