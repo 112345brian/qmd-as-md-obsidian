@@ -122,6 +122,10 @@ const DEFAULT_SETTINGS: QmdPluginSettings = {
 export default class QmdAsMdPlugin extends Plugin {
   settings: QmdPluginSettings;
   activePreviewProcesses: Map<string, ActivePreview> = new Map();
+  // Files with a one-shot `quarto render` in flight. Guards against a second
+  // render of the same source (double-clicked ribbon, repeated command) —
+  // two renders write the same output files and corrupt each other.
+  private activeRenders = new Set<string>();
   // The .qmd file the outline should describe. Tracked separately from the
   // active leaf: clicking inside the outline sidebar makes *it* the active
   // leaf, so the outline must remember the last real .qmd rather than ask
@@ -246,9 +250,12 @@ export default class QmdAsMdPlugin extends Plugin {
   hasQuartoProjectConfigInPath(file: TFile): boolean {
     let dir = file.parent?.path ?? '';
     while (true) {
-      const configPath = normalizePath(dir ? `${dir}/_quarto.yml` : '_quarto.yml');
-      if (this.app.vault.getAbstractFileByPath(configPath) instanceof TFile) {
-        return true;
+      // Quarto accepts both spellings of the project config file.
+      for (const name of ['_quarto.yml', '_quarto.yaml']) {
+        const configPath = normalizePath(dir ? `${dir}/${name}` : name);
+        if (this.app.vault.getAbstractFileByPath(configPath) instanceof TFile) {
+          return true;
+        }
       }
       if (!dir) return false;
       const slash = dir.lastIndexOf('/');
@@ -722,7 +729,12 @@ export default class QmdAsMdPlugin extends Plugin {
   private killPreviewProcess(quartoProcess: ChildProcess): void {
     if (quartoProcess.killed || quartoProcess.pid === undefined) return;
     if (process.platform === 'win32') {
-      spawn('taskkill', ['/pid', String(quartoProcess.pid), '/t', '/f']);
+      // Without an 'error' listener a failed spawn (taskkill missing from
+      // PATH) raises an uncaught exception in the renderer process.
+      spawn('taskkill', ['/pid', String(quartoProcess.pid), '/t', '/f']).on(
+        'error',
+        (err) => console.error('[qmd-as-md] taskkill failed:', err)
+      );
       return;
     }
     try {
@@ -739,10 +751,17 @@ export default class QmdAsMdPlugin extends Plugin {
   }
 
   async stopPreview(file: TFile) {
-    const activePreview = this.activePreviewProcesses.get(file.path);
+    this.stopPreviewByPath(file.path);
+  }
+
+  // Path-keyed variant: lets callers stop a preview without a live TFile —
+  // needed when the source file is no longer eligible (setting turned off)
+  // or was deleted while its preview is still running.
+  stopPreviewByPath(filePath: string) {
+    const activePreview = this.activePreviewProcesses.get(filePath);
     if (activePreview) {
       this.killPreviewProcess(activePreview.process);
-      this.activePreviewProcesses.delete(file.path);
+      this.activePreviewProcesses.delete(filePath);
       new Notice('Quarto preview stopped');
     }
   }
@@ -759,6 +778,10 @@ export default class QmdAsMdPlugin extends Plugin {
   }
 
   async renderPdf(file: TFile, toFormat?: 'pdf' | 'typst') {
+    if (this.activeRenders.has(file.path)) {
+      new Notice(`A Quarto render of ${file.name} is already running.`);
+      return;
+    }
     try {
       const abstractFile = this.app.vault.getAbstractFileByPath(file.path);
       if (!abstractFile || !(abstractFile instanceof TFile)) {
@@ -800,6 +823,7 @@ export default class QmdAsMdPlugin extends Plugin {
         cwd: workingDir,
         env: envVars,
       });
+      this.activeRenders.add(file.path);
 
       let detectedOutputBasename: string | null = null;
       // Quarto prints the human-readable cause on "ERROR:" lines (bad YAML,
@@ -838,7 +862,10 @@ export default class QmdAsMdPlugin extends Plugin {
         );
       });
 
+      // 'close' fires even after a spawn 'error' (ENOENT etc.), so this is
+      // the single reliable place to release the render lock.
       quartoProcess.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+        this.activeRenders.delete(file.path);
         void (async () => {
           renderStdout.flush(); // release any final partial line
           renderStderr.flush();
@@ -916,6 +943,7 @@ export default class QmdAsMdPlugin extends Plugin {
         });
       });
     } catch (error) {
+      this.activeRenders.delete(file.path);
       console.error('Failed to render Quarto PDF:', error);
       new Notice('Failed to render Quarto PDF');
     }
@@ -987,6 +1015,8 @@ class QmdSettingTab extends PluginSettingTab {
             this.plugin.settings.enableQmdLinking = value;
             if (value) {
               this.plugin.registerQmdExtension();
+            } else {
+              new Notice('Reload the plugin to stop opening .qmd files in the editor.');
             }
             await this.plugin.saveSettings();
           })
@@ -1047,6 +1077,16 @@ class QmdSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.previewMarkdownFiles)
           .onChange(async (value) => {
             this.plugin.settings.previewMarkdownFiles = value;
+            if (!value) {
+              // With the setting off, the toggle command refuses .md files,
+              // so a still-running .md preview would become an unstoppable
+              // orphan process. Stop them now.
+              for (const path of [...this.plugin.activePreviewProcesses.keys()]) {
+                if (path.toLowerCase().endsWith('.md')) {
+                  this.plugin.stopPreviewByPath(path);
+                }
+              }
+            }
             await this.plugin.saveSettings();
           })
       );

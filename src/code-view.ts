@@ -1,6 +1,6 @@
 import { EditorState, RangeSetBuilder, StateField, Text } from '@codemirror/state';
 import { Decoration, DecorationSet, EditorView, keymap } from '@codemirror/view';
-import { indentMore, indentLess } from '@codemirror/commands';
+import { history, historyKeymap, indentMore, indentLess } from '@codemirror/commands';
 import { TextFileView, WorkspaceLeaf } from 'obsidian';
 
 export const QMD_YAML_VIEW = 'qmd-yaml-view';
@@ -326,34 +326,44 @@ abstract class QmdCodeFileView extends TextFileView {
     return 'file-code';
   }
 
+  // Fresh EditorState for a document. Used on first mount and whenever
+  // setViewData is called with clear=true (a different file loaded into this
+  // leaf) — a fresh state drops the undo history, so Ctrl+Z cannot resurrect
+  // the previous file's contents into the new one.
+  private makeEditorState(doc: string): EditorState {
+    return EditorState.create({
+      doc,
+      extensions: [
+        EditorState.tabSize.of(2),
+        this.config.highlightField,
+        history(),
+        EditorView.contentAttributes.of({
+          'aria-label': this.config.ariaLabel,
+          autocapitalize: 'off',
+          autocomplete: 'off',
+          spellcheck: 'false',
+        }),
+        keymap.of([
+          ...historyKeymap,
+          { key: 'Tab', run: indentMore },
+          { key: 'Shift-Tab', run: indentLess },
+        ]),
+        EditorView.updateListener.of((update) => {
+          if (!update.docChanged || this.settingViewData) return;
+          this.data = update.state.doc.toString();
+          this.requestSave();
+        }),
+      ],
+    });
+  }
+
   onload(): void {
     super.onload();
     this.contentEl.empty();
     this.contentEl.addClass('qmd-code-view');
     this.editorView = new EditorView({
       parent: this.contentEl,
-      state: EditorState.create({
-        doc: this.data ?? '',
-        extensions: [
-          EditorState.tabSize.of(2),
-          this.config.highlightField,
-          EditorView.contentAttributes.of({
-            'aria-label': this.config.ariaLabel,
-            autocapitalize: 'off',
-            autocomplete: 'off',
-            spellcheck: 'false',
-          }),
-          keymap.of([
-            { key: 'Tab', run: indentMore },
-            { key: 'Shift-Tab', run: indentLess },
-          ]),
-          EditorView.updateListener.of((update) => {
-            if (!update.docChanged || this.settingViewData) return;
-            this.data = update.state.doc.toString();
-            this.requestSave();
-          }),
-        ],
-      }),
+      state: this.makeEditorState(this.data ?? ''),
     });
     this.register(() => {
       this.editorView?.destroy();
@@ -365,10 +375,17 @@ abstract class QmdCodeFileView extends TextFileView {
     return this.editorView?.state.doc.toString() ?? this.data ?? '';
   }
 
-  setViewData(data: string): void {
+  setViewData(data: string, clear: boolean): void {
     this.data = data;
     const view = this.editorView;
     if (!view) return;
+    if (clear) {
+      // Different file loaded into this leaf: full state reset (see
+      // makeEditorState). setState fires no transaction, so the update
+      // listener does not schedule a spurious save.
+      view.setState(this.makeEditorState(data));
+      return;
+    }
     const current = view.state.doc.toString();
     if (current === data) return;
     this.settingViewData = true;
@@ -386,7 +403,7 @@ abstract class QmdCodeFileView extends TextFileView {
   }
 
   clear(): void {
-    this.setViewData('');
+    this.setViewData('', true);
   }
 }
 
