@@ -80,8 +80,11 @@ function stripAnsiCodes(text: string): string {
 }
 
 function previewUrlFromLine(line: string): string | null {
-  const match = stripAnsiCodes(line).match(/Browse at\s+(https?:\/\/\S+)/);
-  return match?.[1] ?? null;
+  // Quarto prints human-readable URLs, leaving spaces in output filenames
+  // unescaped. Capture the entire URL to the end of the line, then encode it
+  // before handing it to Electron/the browser.
+  const match = stripAnsiCodes(line).match(/Browse at\s+(https?:\/\/.+?)\s*$/);
+  return match?.[1] ? encodeURI(match[1]) : null;
 }
 
 interface QmdPluginSettings {
